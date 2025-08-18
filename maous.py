@@ -2,11 +2,43 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import numpy as np
-import time
+
+# ==============================
+# USER SETTINGS (adjust here)
+# ==============================
+
+# Distances are normalized (0..1).
+LEFT_TRIGGER_DISTANCE = 0.030    # Thumb–index tip threshold (LEFT)
+RIGHT_TRIGGER_DISTANCE = 0.030   # Thumb–middle tip threshold (RIGHT)
+
+# Optional hand-size scaling to keep behavior consistent across distances
+USE_HAND_SIZE_SCALING = True     # True/False
+SCALE_FACTOR = 0.8               # Typical 0.6–1.0; multiplies wrist->index_mcp reference
+MIN_FLOOR = 0.010                # Safety floor for dynamic thresholds
+
+# Stability (frames to confirm press/release)
+TOUCH_FRAMES_REQUIRED = 2        # 1–3: higher = steadier, slower
+RELEASE_FRAMES_REQUIRED = 2
+
+# Require index up to allow pointer/clicks
+INDEX_MUST_BE_UP_FOR_CLICKS = True
+
+# Cursor smoothing (higher = smoother, slower)
+SMOOTHING = 10
+
+# Camera capture settings
+CAM_WIDTH, CAM_HEIGHT = 640, 480
+REQUEST_FPS = 60
+
+# Line thickness for on-screen guides
+LINE_THICKNESS = 3
+
+# ==============================
+# IMPLEMENTATION
+# ==============================
 
 class HandMouseController:
     def __init__(self):
-        # MediaPipe setup
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
@@ -16,43 +48,26 @@ class HandMouseController:
         )
         self.mp_draw = mp.solutions.drawing_utils
 
-        # Screen and camera
         self.screen_width, self.screen_height = pyautogui.size()
-        self.cam_width, self.cam_height = 640, 480
-        self.request_fps = 60
 
-        # Pointer smoothing
-        self.smoothing = 10
         self.prev_x, self.prev_y = 0, 0
 
-        # Independent cooldowns
-        self.left_cooldown = 0.2
-        self.right_cooldown = 0.2
-        self.last_left_time = 0.0
-        self.last_right_time = 0.0
+        # True drag states
+        self.left_down = False
+        self.right_down = False
 
-        # Debounce/hysteresis
-        self.touch_frames_required = 2     # frames to confirm click
-        self.release_frames_required = 2   # frames to confirm release
+        # Debounce counters
         self.left_touch_frames = 0
-        self.right_touch_frames = 0
         self.left_release_frames = 0
+        self.right_touch_frames = 0
         self.right_release_frames = 0
 
-        # Click states
-        self.left_click_active = False
-        self.right_click_active = False
-
-        # Dynamic threshold base (scaled by hand size)
-        self.min_touch_threshold = 0.03
-        self.scale_factor = 0.8
-        self.index_must_be_up_for_clicks = True  # optional guard
-
-        # Debug info
-        self.last_d_left = 0.0   # thumb-index distance (left click)
-        self.last_d_right = 0.0  # thumb-middle distance (right click)
-        self.last_dyn_thresh = 0.0
+        # Debug values
         self.last_index_up = False
+        self.last_d_left = 0.0     # thumb-index tip distance (LEFT)
+        self.last_d_right = 0.0    # thumb-middle tip distance (RIGHT)
+        self.last_thr_left = 0.0
+        self.last_thr_right = 0.0
 
         pyautogui.FAILSAFE = False
 
@@ -79,150 +94,165 @@ class HandMouseController:
             'thumb_tip': lm_list[g['THUMB_TIP']],
         }
 
-    def is_index_up(self, tip, pip):
-        # MediaPipe y increases downward; tip above pip => tip.y < pip.y
-        return tip.y < pip.y
-
-    def dist(self, p1, p2):
+    @staticmethod
+    def dist(p1, p2):
         return float(np.hypot(p1.x - p2.x, p1.y - p2.y))
 
-    def detect_gestures(self, pts):
-        # Hand size reference: wrist to index_mcp
-        ref_len = self.dist(pts['wrist'], pts['index_mcp'])
-        dyn_thresh = max(self.min_touch_threshold, ref_len * self.scale_factor)
-        self.last_dyn_thresh = dyn_thresh
-
-        # Pointer gating
-        index_up = self.is_index_up(pts['index_tip'], pts['index_pip'])
-        self.last_index_up = index_up
-
-        # MAPPING REQUIRED:
-        # Left click = thumb + index tip
-        # Right click = thumb + middle tip
-        d_thumb_index = self.dist(pts['thumb_tip'], pts['index_tip'])   # LEFT
-        d_thumb_middle = self.dist(pts['thumb_tip'], pts['middle_tip']) # RIGHT
-
-        self.last_d_left = d_thumb_index
-        self.last_d_right = d_thumb_middle
-
-        left_touch_now = d_thumb_index < dyn_thresh
-        right_touch_now = d_thumb_middle < dyn_thresh
-
-        # Debounce left
-        left_click = False
-        if left_touch_now:
-            self.left_touch_frames += 1
-            self.left_release_frames = 0
-            if self.left_touch_frames >= self.touch_frames_required:
-                left_click = True
-        else:
-            self.left_release_frames += 1
-            if self.left_release_frames >= self.release_frames_required:
-                self.left_touch_frames = 0
-
-        # Debounce right
-        right_click = False
-        if right_touch_now:
-            self.right_touch_frames += 1
-            self.right_release_frames = 0
-            if self.right_touch_frames >= self.touch_frames_required:
-                right_click = True
-        else:
-            self.right_release_frames += 1
-            if self.right_release_frames >= self.release_frames_required:
-                self.right_touch_frames = 0
-
-        return {
-            'pointing': index_up,
-            'left_click': left_click,
-            'right_click': right_click,
-            'pointer_pos': pts['index_tip']
-        }
+    @staticmethod
+    def is_index_up(tip, pip):
+        # MediaPipe normalized y increases downward; tip above pip means "up"
+        return tip.y < pip.y
 
     def smooth_move(self, x, y):
-        sx = self.prev_x + (x - self.prev_x) / self.smoothing
-        sy = self.prev_y + (y - self.prev_y) / self.smoothing
+        sx = self.prev_x + (x - self.prev_x) / SMOOTHING
+        sy = self.prev_y + (y - self.prev_y) / SMOOTHING
         self.prev_x, self.prev_y = sx, sy
         return int(sx), int(sy)
 
-    def handle_actions(self, gestures):
-        now = time.time()
+    def detect_and_update(self, pts):
+        # Distances
+        d_thumb_index = self.dist(pts['thumb_tip'], pts['index_tip'])    # LEFT
+        d_thumb_middle = self.dist(pts['thumb_tip'], pts['middle_tip'])  # RIGHT
+        self.last_d_left = d_thumb_index
+        self.last_d_right = d_thumb_middle
 
-        # Pointer move only when index is up
-        if gestures['pointing']:
-            pos = gestures['pointer_pos']
-            sx, sy = int(pos.x * self.screen_width), int(pos.y * self.screen_height)
+        # Thresholds (scaled if enabled)
+        if USE_HAND_SIZE_SCALING:
+            ref_len = self.dist(pts['wrist'], pts['index_mcp'])
+            dyn = max(MIN_FLOOR, ref_len * SCALE_FACTOR)
+            thr_left = max(LEFT_TRIGGER_DISTANCE, dyn)
+            thr_right = max(RIGHT_TRIGGER_DISTANCE, dyn)
+        else:
+            thr_left = LEFT_TRIGGER_DISTANCE
+            thr_right = RIGHT_TRIGGER_DISTANCE
+
+        self.last_thr_left = thr_left
+        self.last_thr_right = thr_right
+
+        # Touch decisions
+        left_touch_now = d_thumb_index < thr_left
+        right_touch_now = d_thumb_middle < thr_right
+
+        # Index up gating
+        index_up = self.is_index_up(pts['index_tip'], pts['index_pip'])
+        self.last_index_up = index_up
+        clicks_ok = (index_up or not INDEX_MUST_BE_UP_FOR_CLICKS)
+
+        # Debounce for left
+        left_confirm = False
+        left_release = False
+        if left_touch_now:
+            self.left_touch_frames += 1
+            self.left_release_frames = 0
+            if self.left_touch_frames >= TOUCH_FRAMES_REQUIRED:
+                left_confirm = True
+        else:
+            self.left_release_frames += 1
+            if self.left_release_frames >= RELEASE_FRAMES_REQUIRED:
+                self.left_touch_frames = 0
+                left_release = True
+
+        # Debounce for right
+        right_confirm = False
+        right_release = False
+        if right_touch_now:
+            self.right_touch_frames += 1
+            self.right_release_frames = 0
+            if self.right_touch_frames >= TOUCH_FRAMES_REQUIRED:
+                right_confirm = True
+        else:
+            self.right_release_frames += 1
+            if self.right_release_frames >= RELEASE_FRAMES_REQUIRED:
+                self.right_touch_frames = 0
+                right_release = True
+
+        return clicks_ok, left_confirm, left_release, right_confirm, right_release
+
+    def handle_actions(self, clicks_ok, left_confirm, left_release, right_confirm, right_release, pointer_pos):
+        # Pointer movement when index is up
+        if self.last_index_up:
+            sx, sy = int(pointer_pos.x * self.screen_width), int(pointer_pos.y * self.screen_height)
             mx, my = self.smooth_move(sx, sy)
             pyautogui.moveTo(mx, my)
 
-        # Optional: also require index up to allow clicks at all
-        clicks_ok = (gestures['pointing'] or not self.index_must_be_up_for_clicks)
+        # LEFT drag (mouseDown on confirm, mouseUp on release)
+        if clicks_ok and left_confirm and not self.left_down:
+            pyautogui.mouseDown(button='left')
+            self.left_down = True
+            # Ensure mutual exclusivity
+            if self.right_down:
+                pyautogui.mouseUp(button='right')
+                self.right_down = False
+            print("Left Down")
+        if self.left_down and left_release:
+            pyautogui.mouseUp(button='left')
+            self.left_down = False
+            print("Left Up")
 
-        # Left click (thumb + index)
-        if clicks_ok and gestures['left_click'] and not self.left_click_active:
-            if (now - self.last_left_time) > self.left_cooldown:
-                pyautogui.click(button='left')
-                self.left_click_active = True
-                self.last_left_time = now
-                print("Left Click")
-        elif not gestures['left_click']:
-            self.left_click_active = False
+        # RIGHT drag
+        if clicks_ok and right_confirm and not self.right_down:
+            pyautogui.mouseDown(button='right')
+            self.right_down = True
+            if self.left_down:
+                pyautogui.mouseUp(button='left')
+                self.left_down = False
+            print("Right Down")
+        if self.right_down and right_release:
+            pyautogui.mouseUp(button='right')
+            self.right_down = False
+            print("Right Up")
 
-        # Right click (thumb + middle)
-        if clicks_ok and gestures['right_click'] and not self.right_click_active:
-            if (now - self.last_right_time) > self.right_cooldown:
-                pyautogui.click(button='right')
-                self.right_click_active = True
-                self.last_right_time = now
-                print("Right Click")
-        elif not gestures['right_click']:
-            self.right_click_active = False
+    def draw_overlay(self, frame, hand_landmarks, pts):
+        self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
 
-    def draw_overlay(self, img, hand_landmarks, gestures, pts):
-        self.mp_draw.draw_landmarks(img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+        # Status text
+        cv2.putText(frame, f"Pointing: {self.last_index_up}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.last_index_up else (0,0,255), 2)
+        cv2.putText(frame, f"Left Down: {self.left_down}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.left_down else (0,0,255), 2)
+        cv2.putText(frame, f"Right Down: {self.right_down}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.right_down else (0,0,255), 2)
 
-        # Status
-        cv2.putText(img, f"Pointing: {gestures['pointing']}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if gestures['pointing'] else (0,0,255), 2)
-        cv2.putText(img, f"Left Click: {gestures['left_click']}", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if gestures['left_click'] else (0,0,255), 2)
-        cv2.putText(img, f"Right Click: {gestures['right_click']}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if gestures['right_click'] else (0,0,255), 2)
+        # Distances vs thresholds
+        cv2.putText(frame, f"LEFT  d(t-i)={self.last_d_left:.3f}  < thr {self.last_thr_left:.3f}", (10, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2)
+        cv2.putText(frame, f"RIGHT d(t-m)={self.last_d_right:.3f} < thr {self.last_thr_right:.3f}", (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2)
 
-        # Debug distances
-        cv2.putText(img, f"d(thumb-index)= {self.last_d_left:.3f}  [LEFT]", (10, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
-        cv2.putText(img, f"d(thumb-middle)= {self.last_d_right:.3f} [RIGHT]", (10, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
-        cv2.putText(img, f"dyn_thresh: {self.last_dyn_thresh:.3f}", (10, 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,255,200), 2)
+        # Draw connector lines and fingertip dots
+        h, w = frame.shape[:2]
+        def pt_to_xy(p): return int(p.x * w), int(p.y * h)
 
-        # Draw dots: thumb (yellow), index (green), middle (purple)
-        h, w = img.shape[:2]
-        pts_colors = [
-            (pts['thumb_tip'], (0,255,255)),     # yellow
-            (pts['index_tip'], (0,255,0)),       # green
-            (pts['middle_tip'], (255,0,255)),    # purple
-        ]
-        for p, color in pts_colors:
-            cx, cy = int(p.x * w), int(p.y * h)
-            cv2.circle(img, (cx, cy), 6, color, -1)
+        thumb_xy = pt_to_xy(pts['thumb_tip'])
+        index_xy = pt_to_xy(pts['index_tip'])
+        middle_xy = pt_to_xy(pts['middle_tip'])
 
-        return img
+        # Line colors: normal vs active
+        left_color = (0, 200, 0) if not self.left_down else (0, 255, 0)   # green; brighter when active
+        right_color = (200, 0, 0) if not self.right_down else (255, 255, 0) # blue-ish to cyan when active
+
+        # Draw lines
+        cv2.line(frame, thumb_xy, index_xy, left_color, LINE_THICKNESS)
+        cv2.line(frame, thumb_xy, middle_xy, right_color, LINE_THICKNESS)
+
+        # Dots
+        cv2.circle(frame, thumb_xy, 6, (0,255,255), -1)   # thumb: yellow
+        cv2.circle(frame, index_xy, 6, (0,255,0), -1)     # index: green
+        cv2.circle(frame, middle_xy, 6, (255,0,255), -1)  # middle: purple
+
+        return frame
 
     def run(self):
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cam_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cam_height)
-        cap.set(cv2.CAP_PROP_FPS, self.request_fps)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, REQUEST_FPS)
 
         print("Hand Mouse Controller Started!")
-        print("Gestures:")
-        print("- Move: index finger up (pointer follows index tip)")
-        print("- Left click: thumb tip CLOSE to index tip")
-        print("- Right click: thumb tip CLOSE to middle tip")
-        print("- Drag: maintain left click gesture while moving")
-        print("- Press 'q' to quit")
+        print("- Move: index finger up (cursor follows)")
+        print("- Left drag: thumb tip close to index tip (hold to drag)")
+        print("- Right drag: thumb tip close to middle tip (hold to drag)")
+        print("- Press 'q' in the video window to quit")
 
         while True:
             ret, frame = cap.read()
@@ -235,20 +265,28 @@ class HandMouseController:
             results = self.hands.process(rgb)
 
             if results.multi_hand_landmarks:
-                hand_landmarks = results.multi_hand_landmarks[0]
-                lm_list = hand_landmarks.landmark
-
+                hand = results.multi_hand_landmarks[0]
+                lm_list = hand.landmark
                 try:
                     pts = self.get_points(lm_list)
-                    gestures = self.detect_gestures(pts)
-                    self.handle_actions(gestures)
-                    frame = self.draw_overlay(frame, hand_landmarks, gestures, pts)
+                    clicks_ok, l_conf, l_rel, r_conf, r_rel = self.detect_and_update(pts)
+                    self.handle_actions(clicks_ok, l_conf, l_rel, r_conf, r_rel, pts['index_tip'])
+                    frame = self.draw_overlay(frame, hand, pts)
                 except (TypeError, ValueError) as e:
                     print(f"[Landmark error] {e}")
+            else:
+                cv2.putText(frame, "No hand detected", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-            cv2.imshow('Hand Mouse Controller', frame)
+            cv2.imshow("Gesture Mouse", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
+        # Safety: release any held buttons
+        if self.left_down:
+            pyautogui.mouseUp(button='left')
+        if self.right_down:
+            pyautogui.mouseUp(button='right')
 
         cap.release()
         cv2.destroyAllWindows()
