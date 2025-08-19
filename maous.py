@@ -8,30 +8,36 @@ import numpy as np
 # ==============================
 
 # Distances are normalized (0..1).
-LEFT_TRIGGER_DISTANCE = 0.030    # Thumb–index tip threshold (LEFT)
-RIGHT_TRIGGER_DISTANCE = 0.030   # Thumb–middle tip threshold (RIGHT)
+LEFT_TRIGGER_DISTANCE = 0.001    # Thumb–index tip threshold (LEFT)
+RIGHT_TRIGGER_DISTANCE = 0.001   # Thumb–middle tip threshold (RIGHT)
 
 # Optional hand-size scaling to keep behavior consistent across distances
 USE_HAND_SIZE_SCALING = True     # True/False
-SCALE_FACTOR = 0.8               # Typical 0.6–1.0; multiplies wrist->index_mcp reference
+SCALE_FACTOR = 1.0               # Typical 0.6–1.0; multiplies wrist->index_mcp reference
 MIN_FLOOR = 0.010                # Safety floor for dynamic thresholds
 
 # Stability (frames to confirm press/release)
-TOUCH_FRAMES_REQUIRED = 2        # 1–3: higher = steadier, slower
-RELEASE_FRAMES_REQUIRED = 2
+TOUCH_FRAMES_REQUIRED = 1        # 1–3: higher = steadier, slower
+RELEASE_FRAMES_REQUIRED = 1
 
-# Require index up to allow pointer/clicks
-INDEX_MUST_BE_UP_FOR_CLICKS = True
+# Require thumb extended to allow pointer/clicks
+THUMB_MUST_BE_EXTENDED_FOR_CLICKS = True
 
 # Cursor smoothing (higher = smoother, slower)
 SMOOTHING = 10
 
+# Sensitivity (higher = more sensitive; smaller hand movements reach screen edges)
+# 1.0: full camera view maps to full screen
+# >1.0 (e.g., 2.0): amplifies; smaller hand area covers full screen
+# <1.0 (e.g., 0.5): attenuates; larger hand area needed
+SENSITIVITY = 1.7
+
 # Camera capture settings
-CAM_WIDTH, CAM_HEIGHT = 640, 480
+CAM_WIDTH, CAM_HEIGHT = 640, 360
 REQUEST_FPS = 60
 
 # Line thickness for on-screen guides
-LINE_THICKNESS = 3
+LINE_THICKNESS = 2
 
 # ==============================
 # IMPLEMENTATION
@@ -63,7 +69,7 @@ class HandMouseController:
         self.right_release_frames = 0
 
         # Debug values
-        self.last_index_up = False
+        self.last_thumb_extended = False
         self.last_d_left = 0.0     # thumb-index tip distance (LEFT)
         self.last_d_right = 0.0    # thumb-middle tip distance (RIGHT)
         self.last_thr_left = 0.0
@@ -74,9 +80,9 @@ class HandMouseController:
         # Landmark indices
         self.IDX = {
             'WRIST': 0,
+            'THUMB_IP': 3,
             'THUMB_TIP': 4,
             'INDEX_MCP': 5,
-            'INDEX_PIP': 6,
             'INDEX_TIP': 8,
             'MIDDLE_TIP': 12,
         }
@@ -87,11 +93,11 @@ class HandMouseController:
         g = self.IDX
         return {
             'wrist': lm_list[g['WRIST']],
+            'thumb_ip': lm_list[g['THUMB_IP']],
+            'thumb_tip': lm_list[g['THUMB_TIP']],
             'index_mcp': lm_list[g['INDEX_MCP']],
-            'index_pip': lm_list[g['INDEX_PIP']],
             'index_tip': lm_list[g['INDEX_TIP']],
             'middle_tip': lm_list[g['MIDDLE_TIP']],
-            'thumb_tip': lm_list[g['THUMB_TIP']],
         }
 
     @staticmethod
@@ -99,9 +105,16 @@ class HandMouseController:
         return float(np.hypot(p1.x - p2.x, p1.y - p2.y))
 
     @staticmethod
-    def is_index_up(tip, pip):
-        # MediaPipe normalized y increases downward; tip above pip means "up"
-        return tip.y < pip.y
+    def is_thumb_extended(tip, ip):
+        # Check if thumb tip is "extended" (tip above IP in y; adapt as needed)
+        return tip.y < ip.y
+
+    @staticmethod
+    def apply_sensitivity(pos, sensitivity):
+        # Amplify/attenuate around center [0,1] range
+        transformed = 0.5 + sensitivity * (pos - 0.5)
+        # Clamp to [0,1]
+        return max(0.0, min(1.0, transformed))
 
     def smooth_move(self, x, y):
         sx = self.prev_x + (x - self.prev_x) / SMOOTHING
@@ -133,10 +146,10 @@ class HandMouseController:
         left_touch_now = d_thumb_index < thr_left
         right_touch_now = d_thumb_middle < thr_right
 
-        # Index up gating
-        index_up = self.is_index_up(pts['index_tip'], pts['index_pip'])
-        self.last_index_up = index_up
-        clicks_ok = (index_up or not INDEX_MUST_BE_UP_FOR_CLICKS)
+        # Thumb extended gating
+        thumb_extended = self.is_thumb_extended(pts['thumb_tip'], pts['thumb_ip'])
+        self.last_thumb_extended = thumb_extended
+        clicks_ok = (thumb_extended or not THUMB_MUST_BE_EXTENDED_FOR_CLICKS)
 
         # Debounce for left
         left_confirm = False
@@ -169,9 +182,13 @@ class HandMouseController:
         return clicks_ok, left_confirm, left_release, right_confirm, right_release
 
     def handle_actions(self, clicks_ok, left_confirm, left_release, right_confirm, right_release, pointer_pos):
-        # Pointer movement when index is up
-        if self.last_index_up:
-            sx, sy = int(pointer_pos.x * self.screen_width), int(pointer_pos.y * self.screen_height)
+        # Pointer movement when thumb is extended
+        if self.last_thumb_extended:
+            # Apply sensitivity to normalized coordinates
+            sens_x = self.apply_sensitivity(pointer_pos.x, SENSITIVITY)
+            sens_y = self.apply_sensitivity(pointer_pos.y, SENSITIVITY)
+            # Map to screen
+            sx, sy = int(sens_x * self.screen_width), int(sens_y * self.screen_height)
             mx, my = self.smooth_move(sx, sy)
             pyautogui.moveTo(mx, my)
 
@@ -206,14 +223,14 @@ class HandMouseController:
         self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
 
         # Status text
-        cv2.putText(frame, f"Pointing: {self.last_index_up}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.last_index_up else (0,0,255), 2)
+        cv2.putText(frame, f"Thumb Extended: {self.last_thumb_extended}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.last_thumb_extended else (0,0,255), 2)
         cv2.putText(frame, f"Left Down: {self.left_down}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.left_down else (0,0,255), 2)
         cv2.putText(frame, f"Right Down: {self.right_down}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if self.right_down else (0,0,255), 2)
 
-        # Distances vs thresholds
+        # Debug distances vs thresholds
         cv2.putText(frame, f"LEFT  d(t-i)={self.last_d_left:.3f}  < thr {self.last_thr_left:.3f}", (10, 125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 2)
         cv2.putText(frame, f"RIGHT d(t-m)={self.last_d_right:.3f} < thr {self.last_thr_right:.3f}", (10, 150),
@@ -249,7 +266,7 @@ class HandMouseController:
         cap.set(cv2.CAP_PROP_FPS, REQUEST_FPS)
 
         print("Hand Mouse Controller Started!")
-        print("- Move: index finger up (cursor follows)")
+        print("- Move: thumb extended (cursor follows thumb tip)")
         print("- Left drag: thumb tip close to index tip (hold to drag)")
         print("- Right drag: thumb tip close to middle tip (hold to drag)")
         print("- Press 'q' in the video window to quit")
@@ -270,7 +287,7 @@ class HandMouseController:
                 try:
                     pts = self.get_points(lm_list)
                     clicks_ok, l_conf, l_rel, r_conf, r_rel = self.detect_and_update(pts)
-                    self.handle_actions(clicks_ok, l_conf, l_rel, r_conf, r_rel, pts['index_tip'])
+                    self.handle_actions(clicks_ok, l_conf, l_rel, r_conf, r_rel, pts['thumb_tip'])
                     frame = self.draw_overlay(frame, hand, pts)
                 except (TypeError, ValueError) as e:
                     print(f"[Landmark error] {e}")
