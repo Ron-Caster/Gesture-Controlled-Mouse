@@ -15,7 +15,7 @@ class HandGestureMouseControl:
             static_image_mode=False,
             max_num_hands=1,
             min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
         )
         self.mp_draw = mp.solutions.drawing_utils
 
@@ -42,14 +42,56 @@ class HandGestureMouseControl:
         # Tkinter GUI
         self.root = tk.Tk()
         self.root.title("Circle Radius Adjuster")
-        self.root.geometry("300x100")
+        self.root.geometry("340x200")
 
         ttk.Label(self.root, text="Adjust Circle Radius (1-100):").pack(pady=10)
 
-        self.radius_slider = ttk.Scale(self.root, from_=1, to=100, orient='horizontal',
-                                       command=self.update_radius)
+        self.radius_slider = ttk.Scale(
+            self.root,
+            from_=1,
+            to=100,
+            orient="horizontal",
+            command=self.update_radius,
+        )
         self.radius_slider.set(self.radius)
-        self.radius_slider.pack(fill='x', padx=10)
+        self.radius_slider.pack(fill="x", padx=10)
+
+        # Pointer landmark selection (which hand node controls the cursor)
+        self.landmark_names = {
+            0: "WRIST",
+            1: "THUMB_CMC",
+            2: "THUMB_MCP",
+            3: "THUMB_IP",
+            4: "THUMB_TIP",
+            5: "INDEX_MCP",
+            6: "INDEX_PIP",
+            7: "INDEX_DIP",
+            8: "INDEX_TIP",
+            9: "MIDDLE_MCP",
+            10: "MIDDLE_PIP",
+            11: "MIDDLE_DIP",
+            12: "MIDDLE_TIP",
+            13: "RING_MCP",
+            14: "RING_PIP",
+            15: "RING_DIP",
+            16: "RING_TIP",
+            17: "PINKY_MCP",
+            18: "PINKY_PIP",
+            19: "PINKY_DIP",
+            20: "PINKY_TIP",
+        }
+        self.pointer_landmark_id = 4  # default to THUMB_TIP
+        values = [f"{i}: {name}" for i, name in self.landmark_names.items()]
+        ttk.Label(self.root, text="Pointer node:").pack(pady=(8, 0))
+        self.pointer_choice = tk.StringVar(value=f"4: {self.landmark_names[4]}")
+        self.pointer_combo = ttk.Combobox(
+            self.root,
+            textvariable=self.pointer_choice,
+            values=values,
+            state="readonly",
+        )
+        self.pointer_combo.pack(fill="x", padx=10)
+        self.pointer_combo.bind("<<ComboboxSelected>>", self.update_pointer_landmark)
 
         # Thread coordination and cleanup helpers
         self.stop_event = threading.Event()
@@ -70,6 +112,16 @@ class HandGestureMouseControl:
 
     def update_radius(self, val):
         self.radius = int(float(val))
+
+    def update_pointer_landmark(self, event=None):
+        # Parse selected combobox value and update the pointer landmark id
+        try:
+            sel = self.pointer_choice.get()
+            lm_id = int(sel.split(":")[0].strip())
+            if 0 <= lm_id <= 20:
+                self.pointer_landmark_id = lm_id
+        except Exception:
+            pass
 
     def on_close(self):
         # Signal the video loop to stop and perform cleanup.
@@ -172,11 +224,18 @@ class HandGestureMouseControl:
                         tip_positions[lm_id] = (cx, cy)
                         cv2.circle(frame, (cx, cy), self.radius, colors[idx], 2)
 
-                    # Mouse movement using thumb tip
-                    thumb_pos = tip_positions[4]
-                    mouse_x = int(np.interp(thumb_pos[0], (0, w), (0, self.screen_width)))
-                    mouse_y = int(np.interp(thumb_pos[1], (0, h), (0, self.screen_height)))
-                    pyautogui.moveTo(mouse_x, mouse_y)
+                    # Mouse movement using selected pointer landmark
+                    try:
+                        lm_ptr = hand_landmarks.landmark[self.pointer_landmark_id]
+                        px, py = int(lm_ptr.x * w), int(lm_ptr.y * h)
+                        mouse_x = int(np.interp(px, (0, w), (0, self.screen_width)))
+                        mouse_y = int(np.interp(py, (0, h), (0, self.screen_height)))
+                        pyautogui.moveTo(mouse_x, mouse_y)
+                        # Highlight the selected pointer node
+                        cv2.circle(frame, (px, py), max(8, self.radius), (0, 0, 255), 2)
+                        cv2.circle(frame, (px, py), 3, (0, 0, 255), -1)
+                    except Exception:
+                        pass
 
                     # Calculate distances for overlap detection
                     dist_thumb_index = np.linalg.norm(np.array(tip_positions[4]) - np.array(tip_positions[8]))
